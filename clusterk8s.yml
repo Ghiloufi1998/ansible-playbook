@@ -1,0 +1,158 @@
+- hosts: masters
+  become: true
+  vars:
+    kube_version: "1.25.5-00"
+    pod_network_cidr: "172.16.1.0/24"
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Docker
+      apt:
+        name: docker.io
+        state: present
+
+    - name: Download and install containerd
+      become: true
+      shell: |
+        wget https://github.com/containerd/containerd/releases/download/v1.6.12/containerd-1.6.12-linux-amd64.tar.gz
+        tar xvf containerd-1.6.12-linux-amd64.tar.gz
+        systemctl stop containerd
+        cd bin
+        cp * /usr/bin/
+        systemctl start containerd
+
+    - name: Configure containerd
+      become: true
+      shell: |
+        cat > /etc/containerd/config.toml <<EOF
+        [plugins."io.containerd.grpc.v1.cri"]
+          systemd_cgroup = true
+        EOF
+        systemctl restart containerd
+
+    - name: Add Kubernetes apt repository
+      shell: |
+        sudo apt update
+        sudo apt install -y apt-transport-https ca-certificates curl
+        curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+        sudo apt update
+
+    - name: Install Kubernetes packages
+      apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+      with_items:
+        - kubeadm={{ kube_version }}
+        - kubelet={{ kube_version }}
+        - kubectl={{ kube_version }}
+
+    - name: Enable and start Docker
+      service:
+        name: docker
+        enabled: yes
+        state: started
+
+    - name: Enable and start kubelet
+      service:
+        name: kubelet
+        enabled: yes
+        state: started
+
+    - name: Disable swap
+      command: "swapoff -a"
+
+    - name: Initialize cluster
+      command: kubeadm init --pod-network-cidr={{ pod_network_cidr }} --kubernetes-version 1.25.5 --ignore-preflight-errors=DirAvailable--var-lib-etcd
+      register: init_output
+      changed_when: "'certificate embedded in the kubeconfig file' in init_output.stdout"
+
+    - name: Print kubeadm init output
+      debug:
+        var: init_output.stdout
+
+    - name: Create .kube directory
+      file:
+        path: "{{ ansible_env.HOME }}/.kube"
+        state: directory
+
+    - name: Copy admin.conf to .kube directory
+      copy:
+        remote_src: yes
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ ansible_env.HOME }}/.kube/config"
+
+    - name: Change ownership of .kube directory
+      file:
+        path: "{{ ansible_env.HOME }}/.kube"
+        state: directory
+        recurse: yes
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_id }}"
+
+    - name: Download Calico manifest
+      command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml
+
+    - name: Get join token and hash
+      command: kubeadm token create --print-join-command
+      register: join_output
+
+    - name: Set join command variable
+      set_fact:
+        join_command: "{{ join_output.stdout_lines[0] }}"
+- hosts: workers
+  become: true
+  vars:
+    kube_version: "1.25.5-00"
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Docker
+      apt:
+        name: docker.io
+        state: present
+
+    - name: Download and install containerd
+      become: true
+      shell: |
+        wget https://github.com/containerd/containerd/releases/download/v1.6.12/containerd-1.6.12-linux-amd64.tar.gz
+        tar xvf containerd-1.6.12-linux-amd64.tar.gz
+        systemctl stop containerd
+        cd bin
+        cp * /usr/bin/
+        systemctl start containerd
+
+    - name: Configure containerd
+      become: true
+      shell: |
+        cat > /etc/containerd/config.toml <<EOF
+        [plugins."io.containerd.grpc.v1.cri"]
+          systemd_cgroup = true
+        EOF
+        systemctl restart containerd
+        
+    - name: Add Kubernetes apt repository
+      shell: |
+        sudo apt update
+        sudo apt install -y apt-transport-https ca-certificates curl
+        curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+        sudo apt update
+
+    - name: Install Kubernetes packages
+      apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+      with_items:
+        - kubeadm={{ kube_version }}
+        - kubelet={{ kube_version }}
+        - kubectl={{ kube_version }}
+
+    - name: Join the cluster
+      command: "{{ hostvars['master-node'].join_command }}  --ignore-preflight-errors=FileAvailable--etc-kubernetes-kubelet.conf,Port-10250,FileAvailable--etc-kubernetes-pki-ca.crt"
